@@ -223,6 +223,7 @@ if not env.is_light_import():
     from . import ir  # noqa: F401
     from . import tileop  # noqa: F401
     from . import cpu as cpu  # noqa: F401
+    from . import t1 as t1  # noqa: F401
     from . import ascend as ascend  # noqa: F401
     from . import cuda as cuda  # noqa: F401
     from . import rocm as rocm  # noqa: F401

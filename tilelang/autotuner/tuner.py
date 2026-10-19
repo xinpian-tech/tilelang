@@ -184,7 +184,7 @@ class AutoTuner:
         self,
         out_idx: list[int] | int | None = None,
         target: TargetLike | None = None,
-        execution_backend: Literal["auto", "tvm_ffi", "cython", "nvrtc", "torch", "pto"] | None = None,
+        execution_backend: Literal["auto", "tvm_ffi", "cython", "nvrtc", "torch", "pto", "pokedex"] | None = None,
         target_host: TargetLike | None = None,
         verbose: bool | None = None,
         pass_configs: dict[str, Any] | None = None,
@@ -223,6 +223,8 @@ class AutoTuner:
         from tilelang.backend.module import create_backend_context
 
         backend_context = create_backend_context(target, target_host, execution_backend)
+        if backend_context.execution_backend.name == "pokedex":
+            raise NotImplementedError("Pokedex is a functional simulator; hardware autotuning is unsupported")
 
         self.compile_args = CompileArgs(
             out_idx=out_idx,
@@ -1399,7 +1401,7 @@ def autotune(  # This is the new public interface
         Compilation target for TVM (e.g., "cuda", "llvm"). Defaults to "auto".
     target_host : Union[str, dict, Target], optional
         Target host for cross-compilation. Defaults to None.
-    execution_backend : Literal["auto", "tvm_ffi", "cython", "nvrtc", "torch", "pto"], optional
+    execution_backend : Literal["auto", "tvm_ffi", "cython", "nvrtc", "torch", "pto", "pokedex"], optional
         Backend for kernel execution and argument passing. Use "auto" to pick a sensible
         default declared by the target backend (e.g., cuda->tvm_ffi, metal->torch, pto->pto).
     verbose : bool, optional

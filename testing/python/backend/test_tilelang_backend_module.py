@@ -14,6 +14,7 @@ def test_builtin_backend_modules_are_explicit():
         "cutedsl": (("cuda",), ["cutedsl"]),
         "rocm": (("hip",), ["tvm_ffi", "cython"]),
         "cpu": (("c", "llvm"), ["cython", "tvm_ffi"]),
+        "t1": (("t1",), ["pokedex"]),
         "metal": (("metal",), ["torch", "tvm_ffi"]),
         "webgpu": (("webgpu",), ["tvm_ffi"]),
         "ascend": (("ascend",), ["tvm_ffi", "cython"]),
@@ -64,6 +65,7 @@ def test_backend_variants_require_target_predicates():
     ("target_kind", "backend_name", "component_name"),
     [
         ("c", "cpu", "c"),
+        ("t1", "t1", "t1"),
         ("llvm", "cpu", "llvm"),
         ("cuda", "cuda", "cuda"),
         ("hip", "rocm", "hip"),

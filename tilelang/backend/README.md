@@ -288,6 +288,7 @@ and the selected execution backend decides whether and when it is invoked.
 | `tilelang/cuda/backend.py` | `cuda` | Plain CUDA codegen, compiler callbacks, and execution compatibility. |
 | `tilelang/cuda/cutedsl_backend.py` | `cuda` | CuTeDSL variant explicitly reusing the CUDA pipeline. |
 | `tilelang/rocm` | `hip` | ROCm/HIP pipeline, codegen, compiler callback, and MFMA/WMMA extensions. |
+| `tilelang/t1` | `t1` | Four-hart RV32/RVV lowering and freestanding C++; synchronous `pokedex` execution. |
 | `tilelang/cpu` | `c`, `llvm` | CPU pipeline, codegen, and scalar CPU tile-op implementations. |
 | `tilelang/metal` | `metal` | Metal pipeline, codegen, host hook, and Metal language extensions. |
 | `tilelang/webgpu/backend.py` | `webgpu` | WebGPU compiler component registration. |

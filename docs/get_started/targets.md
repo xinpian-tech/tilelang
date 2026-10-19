@@ -19,6 +19,7 @@ dictionary when you need options such as GPU architecture or CPU model. The most
 | `metal` | Apple Silicon GPUs (arm64 Macs). |
 | `llvm` | CPU execution. Use a config dict for options such as `{"kind": "llvm", "mtriple": "x86_64-linux-gnu"}`. |
 | `webgpu` | Browser / WebGPU runtimes. |
+| `t1` | Experimental four-hart RV32/RVV target, executed by Pokedex. Use `{"kind": "t1", "vlen": 256}`. |
 | `c` | Emit plain C source for inspection or custom toolchains. |
 
 To add options, pass a target config dictionary. For example:
@@ -186,3 +187,24 @@ prefer config dictionaries over CLI-style strings.
   running on. Try dropping the flag or switching to the correct compute capability.
 - When targeting multiple environments, use `auto` for convenience and override with an explicit config only when
   you need architecture-specific tuning.
+
+## T1 RVV target
+
+Import `tilelang.t1.language` for the T1 dialect. An initial kernel consists of
+one `T.Kernel(4)` launch over static contiguous FP32 global tensors. Each block
+runs on one SMT hart; `T.Parallel` lowers to loops for LLVM auto-vectorization.
+
+```python
+kernel = tilelang.compile(
+    func, target={"kind": "t1", "vlen": 256}, execution_backend="pokedex"
+)
+kernel(a, b, c)  # CPU float32 tensors
+```
+
+T1 is selected explicitly, not by hardware auto-detection. For an explicit T1
+target, `execution_backend="auto"` selects `pokedex`. Source-only lowering needs
+no simulator or cross compiler. Execution requires Clang/LLD and a matching
+Pokedex runner/model with `run-gpgpu` memory transfers. Scratchpad, atomics,
+reductions, and profiling/autotuning are not implemented in this initial backend.
+See the [T1 example](../../examples/t1/README.md) for build instructions, runtime
+environment variables, supported operations, ABI details, and tests.
