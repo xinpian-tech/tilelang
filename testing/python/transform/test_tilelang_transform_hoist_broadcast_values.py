@@ -6,7 +6,6 @@ import pytest
 import tilelang.testing
 from tilelang import tvm as tvm
 import tilelang as tl
-from tilelang.backend.target import determine_target
 
 
 @tilelang.jit
@@ -50,16 +49,14 @@ def test_hoist_broadcast(dtype):
     kernel(a, b, c, d, e)
 
 
-auto_target = tvm.target.Target(determine_target("auto"))
-
-
 def _check(original, transformed):
+    target = tvm.target.Target("cuda")
     mod = tvm.IRModule.from_expr(original.with_attr("global_symbol", "main"))
-    mod = tvm.tirx.transform.BindTarget(auto_target)(mod)
+    mod = tvm.tirx.transform.BindTarget(target)(mod)
     mod = tl.transform.HoistBroadcastValues()(mod)
 
     transformed = tvm.IRModule.from_expr(transformed.with_attr("global_symbol", "main"))
-    transformed = tvm.tirx.transform.BindTarget(auto_target)(transformed)
+    transformed = tvm.tirx.transform.BindTarget(target)(transformed)
 
     tvm.ir.assert_structural_equal(mod["main"], transformed["main"], True)
 
@@ -80,6 +77,19 @@ def test_transform_hoist():
             A_shared[0:8] = T.Broadcast(broadcast_var, 8) + T.Broadcast(broadcast_var_1, 8)
 
     _check(before, after)
+
+
+def test_hoist_preserves_store_predicate():
+    tir = tvm.tirx
+    buffer = tir.decl_buffer((8,), "float32")
+    mask = tir.Var("mask", "uint1x8")
+    store = tir.BufferStore(buffer, tir.Broadcast(tir.const(1.0, "float32"), 8), [tir.Ramp(0, 1, 8)], predicate=mask)
+    func = tir.PrimFunc([buffer.data, mask], store)
+    mod = tl.transform.HoistBroadcastValues()(tvm.IRModule({"main": func}))
+    stores = []
+    tir.stmt_functor.post_order_visit(mod["main"].body, lambda node: stores.append(node) if isinstance(node, tir.BufferStore) else None)
+    assert len(stores) == 1
+    tvm.ir.assert_structural_equal(stores[0].predicate, mask)
 
 
 def test_transform_hoist_let_stmt():

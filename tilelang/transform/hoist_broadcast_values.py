@@ -36,7 +36,8 @@ class HoistBroadcastValuesMutator(PyStmtExprMutator):
         self.pending_defs = []
 
         new_indices = [self.visit_expr(idx) for idx in op.indices]
-        new_stmt = BufferStore(op.buffer, self.visit_expr(op.value), new_indices)
+        new_predicate = self.visit_expr(op.predicate) if op.predicate is not None else None
+        new_stmt = BufferStore(op.buffer, self.visit_expr(op.value), new_indices, predicate=new_predicate)
 
         if self.pending_defs:
             stmts = [Bind(var, val) for var, val in self.pending_defs]
