@@ -1,9 +1,14 @@
 # T1: four-hart RVV backend
 
 This example uses the registered `t1` target and `pokedex` execution backend.
-Each of four SMT harts executes one block. `T.Parallel` becomes a scalar loop
-inside that block; Clang auto-vectorizes suitable loops into RVV instructions.
-No CUDA thread/lane mapping is involved.
+Each of four SMT harts executes one block. Two codegen modes share the same
+launcher and runtime:
+
+- `codegen="c"` (default): scalar C++ loops, auto-vectorized by Clang into RVV.
+- `codegen="llvm"`: explicit vector TIR, lowered by TVM to LLVM IR (`.ll`),
+  then compiled by Clang into an RV32 object.
+
+`T.Parallel` expresses work inside a block; vector lanes do not create harts.
 
 ## Build and run
 
@@ -18,6 +23,11 @@ cmake --build build -j4
 export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
 ```
 
+For `codegen="llvm"`, configure with `-DUSE_LLVM=ON` and rebuild. This uses an
+installed LLVM with the RISC-V target enabled; it does not build LLVM from source.
+Use a compatible Clang version to compile the emitted IR (LLVM/Clang 23 were
+tested together). The C path does not require LLVM support in the TileLang library.
+
 Execution requires Clang with RV32/RVV support, `ld.lld`, CPU PyTorch, NumPy,
 and Pokedex with the `run-gpgpu` memory-transfer options. Configure the Pokedex
 executable and its matching model library:
@@ -30,6 +40,8 @@ export TILELANG_T1_CLANG=clang++
 
 python examples/t1/vector_add.py
 python examples/t1/vector_add.py --size 259 --vlen 128
+python examples/t1/vector_add.py --codegen llvm
+python examples/t1/vector_add.py --codegen llvm --size 259 --vlen 128
 ```
 
 These Pokedex paths refer to the local development build. See the sibling
@@ -48,7 +60,7 @@ from examples.t1.vector_add import vector_add
 
 kernel = tilelang.compile(
     vector_add(1025),
-    target={"kind": "t1", "vlen": 256},
+    target={"kind": "t1", "vlen": 256, "codegen": "llvm"},
     execution_backend="pokedex",  # also selected by auto for target="t1"
     out_idx=-1,
 )
@@ -62,7 +74,7 @@ argument buffers back after successful completion, so explicit in-place
 updates of an individual argument are supported. Auto-allocated output buffers
 start at zero in simulated memory.
 
-Inspect generated C++ using `kernel.get_kernel_source()` and the guest launcher
+Inspect generated C++ or LLVM IR using `kernel.get_kernel_source(kernel_only=True)` and the guest launcher
 using `kernel.get_host_source()`. The ELF is at `kernel.adapter.libpath`; copy it
 if it must outlive the kernel/cache. The generic disk cache stores that ELF under
 its standard `kernel_lib.so` filename, but the file remains a bare-metal RV32 ELF.
@@ -71,7 +83,8 @@ library. Source-only lowering (`tilelang.lower(func, target="t1")`) requires
 neither the cross compiler nor the simulator.
 
 Cache keys include the target, compile flags, T1 sources/runtime ABI, and
-compiler/linker identities. Clang and LLD must remain available to validate the
+compiler/linker identities, and the linked LLVM major version (or its absence).
+Clang and LLD must remain available to validate the
 cache key. Pokedex and its model are resolved at launch, allowing simulator
 updates without recompiling unchanged guest code. Each launch starts fresh
 simulated memory and hart state. Optional `TILELANG_CACHE_DIR` selects the cache
@@ -85,7 +98,15 @@ serial or parallel elementwise loops. Index arithmetic uses 32-bit integers.
 The dialect is `import tilelang.t1.language as T`. Tensor shapes must be positive;
 all arguments together must fit the 128 MiB transfer arena.
 
-Unsupported features include SIMT `threads=`, vector IR, shared/local allocation,
+The LLVM path strip-mines innermost `T.Parallel` or `T.vectorized` loops into
+fixed-width vectors of up to `vlen / 32` float32 elements. Loop remainders use
+scalar cleanup; supported bounds checks become masked loads/stores. These are
+fixed-width TIR/LLVM vectors lowered to RVV, not scalable-vector TIR or hand-tuned
+RVV intrinsics. Unsupported vector control flow raises an error; it does not
+silently switch to the C path. Serial loops stay serial at the TIR level.
+The C path rejects explicit `T.vectorized` loops.
+
+Unsupported features include SIMT `threads=`, frontend vector-valued expressions, shared/local allocation,
 atomics, tile operations (`T.copy`, GEMM, reductions), scalar kernel arguments,
 dynamic shapes, multiple launches, other dtypes, min/max and floor division/modulo
 expressions, and library math calls. Unsupported constructs fail during lowering.
@@ -115,5 +136,7 @@ python ../T1-thread/pokedex/tests/test_run_gpgpu.py \
 ```
 
 The execution tests need `llvm-objdump` to check that vector-add contains RVV
-loads, additions, and stores. Without simulator environment variables, the
+loads, additions, and stores. Both codegen modes cover tails, repeated inputs,
+four block IDs and disk-cache reconstruction. LLVM execution also checks masked
+stores and runs with Clang loop/SLP autovectorization disabled. Without simulator environment variables, the
 compiler tests run and execution tests skip.

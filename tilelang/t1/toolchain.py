@@ -26,6 +26,8 @@ def compiler():
 
 
 def cache_identity():
+    from tvm.target.codegen import llvm_version_major
+
     clang = compiler()
     linker = required_tool("ld.lld")
     files = sorted(Path(__file__).parent.rglob("*.py")) + sorted(RUNTIME.iterdir())
@@ -36,6 +38,7 @@ def cache_identity():
     return {
         "abi": ABI_VERSION,
         "sources": digest.hexdigest(),
+        "llvm_major": llvm_version_major(allow_none=True),
         "compiler": [clang, subprocess.check_output([clang, "--version"], text=True)],
         "linker": [linker, subprocess.check_output([linker, "--version"], text=True)],
     }
@@ -102,7 +105,8 @@ def build(source, wrapper, target, directory, compile_flags=None):
         "-O3",
     ]
     directory = Path(directory)
-    (directory / "kernel.cpp").write_text(source)
+    kernel_file = directory / ("kernel.ll" if str(target.attrs["codegen"]) == "llvm" else "kernel.cpp")
+    kernel_file.write_text(source)
     (directory / "launcher.cpp").write_text(wrapper)
 
     def invoke(args):
@@ -111,7 +115,7 @@ def build(source, wrapper, target, directory, compile_flags=None):
             raise RuntimeError(f"T1 compiler failed:\n{result.stderr}")
 
     extra = list(compile_flags or [])
-    invoke([*flags, *extra, "-c", str(directory / "kernel.cpp"), "-o", str(directory / "kernel.o")])
+    invoke([*flags, *extra, "-c", str(kernel_file), "-o", str(directory / "kernel.o")])
     invoke([*flags, "-c", str(directory / "launcher.cpp"), "-o", str(directory / "launcher.o")])
     invoke([*flags, "-c", str(RUNTIME / "start.S"), "-o", str(directory / "start.o")])
     output = directory / "kernel.elf"

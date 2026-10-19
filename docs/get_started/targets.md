@@ -192,11 +192,13 @@ prefer config dictionaries over CLI-style strings.
 
 Import `tilelang.t1.language` for the T1 dialect. An initial kernel consists of
 one `T.Kernel(4)` launch over static contiguous FP32 global tensors. Each block
-runs on one SMT hart; `T.Parallel` lowers to loops for LLVM auto-vectorization.
+runs on one SMT hart. The default `codegen="c"` emits scalar C++ for Clang
+autovectorization. `codegen="llvm"` explicitly vectorizes innermost parallel loops
+in TIR and emits LLVM IR; this mode requires a build with `-DUSE_LLVM=ON`.
 
 ```python
 kernel = tilelang.compile(
-    func, target={"kind": "t1", "vlen": 256}, execution_backend="pokedex"
+    func, target={"kind": "t1", "vlen": 256, "codegen": "c"}, execution_backend="pokedex"
 )
 kernel(a, b, c)  # CPU float32 tensors
 ```

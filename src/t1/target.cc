@@ -7,6 +7,7 @@
 
 namespace tvm {
 TVM_REGISTER_TARGET_KIND("t1", kDLExtDev)
+    .add_attr_option<ffi::String>("codegen", ffi::reflection::DefaultValue("c"))
     .add_attr_option<int64_t>("vlen", ffi::reflection::DefaultValue(256))
     .add_attr_option<bool>("supports_kernel_status_return",
                            ffi::reflection::DefaultValue(false))

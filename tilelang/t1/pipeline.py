@@ -1,17 +1,19 @@
-"""T1's initial global-buffer, scalar-loop lowering pipeline.
+"""T1's global-buffer lowering, with C and explicit LLVM vector paths.
 
 One frontend function describes one four-block launch. The device entry takes
 the original buffers followed by the block ID; no host function is generated.
 """
 
-from tvm import IRModule, tirx
+from tvm import IRModule, tirx, transform
 from tvm.ir import CallingConv
 
 import tilelang
+from .target import llvm_target
 
 
 @tirx.transform.prim_func_pass(opt_level=0)
 def prepare(func, mod, ctx):
+    explicit = str(func.attrs["target"].attrs["codegen"]) == "llvm"
     if len(func.params) != len(func.buffer_map):
         raise ValueError("T1 currently accepts only static float32 tensor arguments, not scalar arguments")
     for buffer in func.buffer_map.values():
@@ -52,9 +54,12 @@ def prepare(func, mod, ctx):
             grid.append(node.node.var)
             return node.body
         if isinstance(node, tirx.For):
-            if node.kind == tirx.ForKind.PARALLEL:
+            if node.kind == tirx.ForKind.PARALLEL and not explicit:
                 return tirx.For(node.loop_var, node.min, node.extent, tirx.ForKind.SERIAL, node.body)
-            if node.kind not in (tirx.ForKind.SERIAL, tirx.ForKind.UNROLLED):
+            allowed = (tirx.ForKind.SERIAL, tirx.ForKind.UNROLLED)
+            if explicit:
+                allowed += (tirx.ForKind.PARALLEL, tirx.ForKind.VECTORIZED)
+            if node.kind not in allowed:
                 raise ValueError("T1 supports serial/parallel elementwise loops; explicit vector and thread loops are unsupported")
         if isinstance(node, tirx.PrimExpr):
             dtype = str(node.dtype)
@@ -84,6 +89,73 @@ def prepare(func, mod, ctx):
     return result.with_attr("calling_conv", CallingConv.DEVICE_KERNEL_LAUNCH).with_attr("t1.grid", 4)
 
 
+def vectorize(mod, target):
+    """Strip-mine innermost parallel loops and materialize vector TIR operations."""
+    internal_target = llvm_target(target)
+    width = int(target.attrs["vlen"]) // 32
+
+    def split(node):
+        if not isinstance(node, tirx.For) or node.kind not in (tirx.ForKind.PARALLEL, tirx.ForKind.VECTORIZED):
+            return None
+        nested = []
+        tirx.stmt_functor.post_order_visit(node.body, lambda child: nested.append(child) if isinstance(child, tirx.For) else None)
+        if nested:
+            if node.kind == tirx.ForKind.VECTORIZED:
+                raise ValueError("T1 explicit vector loops must be innermost")
+            return tirx.For(node.loop_var, node.min, node.extent, tirx.ForKind.SERIAL, node.body)
+        if not isinstance(node.extent, tirx.IntImm):
+            raise ValueError("T1 LLVM vectorization requires constant loop extents")
+        extent = int(node.extent)
+        lanes = min(width, extent)
+        if lanes <= 1:
+            return tirx.For(node.loop_var, node.min, node.extent, tirx.ForKind.SERIAL, node.body)
+        chunk = tirx.Var(f"{node.loop_var.name}_chunk", "int32")
+        lane = tirx.Var(f"{node.loop_var.name}_lane", "int32")
+        index = node.min + chunk * lanes + lane
+        body = tirx.stmt_functor.substitute(node.body, {node.loop_var: index})
+        body = tirx.For(lane, 0, lanes, tirx.ForKind.VECTORIZED, body)
+        body = tirx.AttrStmt(lane, "t1.vectorized_region", 1, body)
+        body = tirx.For(chunk, 0, extent // lanes, tirx.ForKind.SERIAL, body)
+        remainder = extent % lanes
+        if remainder:
+            tail_index = node.min + (extent // lanes) * lanes + lane
+            tail = tirx.stmt_functor.substitute(node.body, {node.loop_var: tail_index})
+            tail = tirx.For(lane, 0, remainder, tirx.ForKind.SERIAL, tail)
+            body = tirx.SeqStmt([body, tail])
+        return body
+
+    functions = {}
+    for gv, func in mod.functions.items():
+        body = tirx.stmt_functor.ir_transform(func.body, None, split)
+        functions[gv] = func.with_body(body).with_attr("target", internal_target)
+    mod = IRModule(functions)
+    ctx = transform.PassContext.current()
+    with transform.PassContext(opt_level=ctx.opt_level, config={**ctx.config, "tirx.enable_buffer_level_predication": True}):
+        mod = tirx.transform.VectorizeLoop()(mod)
+
+    # TVM may scalarize unsupported vector control flow. Make this observable.
+    def verify(node):
+        if not isinstance(node, tirx.AttrStmt) or node.attr_key != "t1.vectorized_region":
+            return None
+        stores = []
+        scalarized = []
+        tirx.stmt_functor.post_order_visit(
+            node.body,
+            lambda node: stores.append(node) if isinstance(node, tirx.BufferStore) and node.value.dtype != "float32" else None,
+        )
+        tirx.stmt_functor.post_order_visit(node.body, lambda child: scalarized.append(child) if isinstance(child, tirx.For) else None)
+        if not stores or scalarized:
+            raise ValueError("T1 LLVM could not explicitly vectorize a selected loop; simplify its control flow or use codegen='c'")
+        return node.body
+
+    return IRModule(
+        {
+            gv: func.with_body(tirx.stmt_functor.ir_transform(func.body, None, verify)).with_attr("target", target)
+            for gv, func in mod.functions.items()
+        }
+    )
+
+
 def lower(mod: IRModule, target):
     if len(mod.functions) != 1:
         raise ValueError("T1 currently supports one function per compilation")
@@ -101,4 +173,6 @@ def lower(mod: IRModule, target):
     mod = tilelang.transform.FlattenBuffer()(mod)
     mod = tirx.transform.Simplify()(mod)
     mod = tirx.transform.RemoveNoOp()(mod)
+    if str(target.attrs["codegen"]) == "llvm":
+        mod = vectorize(mod, target)
     return mod

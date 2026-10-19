@@ -15,6 +15,11 @@ from tilelang.backend import create_backend_context
 import tilelang.t1.language as T
 from tilelang.t1 import toolchain
 from examples.t1.vector_add import vector_add
+from tvm import tirx
+from tvm.target.codegen import llvm_version_major
+
+
+CODEGENS = ["c", pytest.param("llvm", marks=pytest.mark.skipif(llvm_version_major(allow_none=True) is None, reason="LLVM disabled"))]
 
 
 def lower(func):
@@ -41,6 +46,47 @@ def test_context_and_source_only(monkeypatch):
 def test_invalid_vlen(vlen):
     with pytest.raises(ValueError, match="vlen must be a power"):
         create_backend_context({"kind": "t1", "vlen": vlen}, None, "auto")
+
+
+def test_invalid_codegen():
+    with pytest.raises(ValueError, match="codegen must be"):
+        create_backend_context({"kind": "t1", "codegen": "invalid"}, None, "auto")
+
+
+def test_missing_llvm(monkeypatch):
+    monkeypatch.setattr("tvm.target.codegen.llvm_version_major", lambda **kwargs: None)
+    with pytest.raises(RuntimeError, match="USE_LLVM=ON"):
+        tilelang.lower(vector_add(), target={"kind": "t1", "codegen": "llvm"})
+    assert 'extern "C"' in lower(vector_add()).kernel_source
+
+
+@pytest.mark.parametrize("vlen", [128, 256])
+@pytest.mark.skipif(llvm_version_major(allow_none=True) is None, reason="LLVM disabled")
+def test_explicit_vector_source(monkeypatch, vlen):
+    monkeypatch.setenv("PATH", "")
+    artifact = tilelang.lower(vector_add(), target={"kind": "t1", "codegen": "llvm", "vlen": vlen})
+    assert f"fadd <{vlen // 32} x float>" in artifact.kernel_source
+    assert "llvm.masked.store" in artifact.kernel_source
+    assert 'target triple = "riscv32-unknown-elf"' in artifact.kernel_source
+    function = next(iter(artifact.device_mod.functions.values()))
+    assert function.attrs["target"].kind.name == "t1"
+    assert int(function.attrs["t1.grid"]) == 4
+    stores = []
+    tirx.stmt_functor.post_order_visit(function.body, lambda node: stores.append(node) if isinstance(node, tirx.BufferStore) else None)
+    assert any(str(store.value.dtype) == f"float32x{vlen // 32}" for store in stores)
+
+
+@pytest.mark.skipif(llvm_version_major(allow_none=True) is None, reason="LLVM disabled")
+def test_unsupported_vector_control_flow():
+    @T.prim_func
+    def main(A: T.Tensor((32,), "float32"), B: T.Tensor((32,), "float32")):
+        with T.Kernel(4) as bx:
+            for i in T.Parallel(8):
+                if A[bx * 8 + i] > 0:
+                    B[bx * 8 + i] = A[bx * 8 + i]
+
+    with pytest.raises(ValueError, match="could not explicitly vectorize"):
+        tilelang.lower(main, target={"kind": "t1", "codegen": "llvm"})
 
 
 def test_execution_compatibility():
@@ -132,29 +178,55 @@ def simulator():
 
 
 @pytest.mark.parametrize(("n", "vlen"), [(1025, 256), (259, 128), (3, 256)])
-def test_execution_repeated_inputs_and_tail(simulator, n, vlen):
-    kernel = tilelang.compile(vector_add(n), target={"kind": "t1", "vlen": vlen}, out_idx=-1)
+@pytest.mark.parametrize("codegen", CODEGENS)
+def test_execution_repeated_inputs_and_tail(simulator, n, vlen, codegen):
+    # Explicit TIR vectorization must survive even with Clang autovectorization disabled.
+    flags = ["-fno-vectorize", "-fno-slp-vectorize"] if codegen == "llvm" else None
+    kernel = tilelang.compile(vector_add(n), target={"kind": "t1", "vlen": vlen, "codegen": codegen}, out_idx=-1, compile_flags=flags)
     for seed in (7, 19):
         generator = torch.Generator().manual_seed(seed)
         a, b = (torch.randn(n, generator=generator) for _ in range(2))
         torch.testing.assert_close(kernel(a, b), a + b, rtol=0, atol=0)
-    if n == 1025:
+    if n > 3:
         dump = subprocess.check_output(["llvm-objdump", "-d", kernel.adapter.libpath], text=True)
         assert re.search(r"\bvle32\.v\b", dump)
         assert re.search(r"\bvfadd\.vv\b", dump)
         assert re.search(r"\bvse32\.v\b", dump)
 
 
-def test_four_block_ids_and_explicit_outputs(simulator):
+@pytest.mark.parametrize("codegen", CODEGENS)
+def test_four_block_ids_and_explicit_outputs(simulator, codegen):
     @T.prim_func
     def main(A: T.Tensor((4,), "float32")):
         with T.Kernel(4) as bx:
             A[bx] = T.Cast("float32", bx)
 
-    kernel = tilelang.compile(main, target="t1")
+    kernel = tilelang.compile(main, target={"kind": "t1", "codegen": codegen})
     output = torch.full((4,), -1.0)
     assert kernel(output) is None
     torch.testing.assert_close(output, torch.arange(4, dtype=torch.float32))
+
+
+@pytest.mark.parametrize("codegen", CODEGENS)
+def test_masked_store_preserves_inactive_elements(simulator, codegen):
+    @T.prim_func
+    def main(A: T.Tensor((40,), "float32")):
+        with T.Kernel(4) as bx:
+            for i in T.vectorized(8):
+                index = bx * 8 + i
+                if index < 31:
+                    A[index] = A[index] + 1.0
+
+    if codegen == "c":
+        with pytest.raises(ValueError, match="explicit vector"):
+            tilelang.lower(main, target="t1")
+        return
+    kernel = tilelang.compile(main, target={"kind": "t1", "codegen": codegen})
+    a = torch.full((40,), 17.0)
+    expected = a.clone()
+    expected[:31] += 1
+    kernel(a)
+    torch.testing.assert_close(a, expected, rtol=0, atol=0)
 
 
 def test_argument_and_failure_diagnostics(simulator, monkeypatch):
@@ -190,18 +262,22 @@ if os.environ.get("CACHE_MUST_HIT"):
     def unexpected(*args, **kwargs):
         raise AssertionError("cache hit must not compile")
     toolchain.build = unexpected
-kernel = tilelang.compile(vector_add(131), target="t1", out_idx=2)
+kernel = tilelang.compile(vector_add(131), target={"kind": "t1", "codegen": os.environ["T1_TEST_CODEGEN"]}, out_idx=2)
 a, b = torch.randn(131), torch.randn(131)
 torch.testing.assert_close(kernel(a, b), a+b, rtol=0, atol=0)
-assert 'extern "C" void main' in kernel.get_kernel_source()
+assert ('extern "C" void main' if os.environ["T1_TEST_CODEGEN"] == "c" else 'define dllexport void @main') in kernel.get_kernel_source()
 assert 't1_runtime_main' in kernel.get_host_source()
 """)
     environment = {**os.environ, "TILELANG_CACHE_DIR": str(tmp_path / "cache")}
+    modes = ["c", "llvm"] if llvm_version_major(allow_none=True) is not None else ["c"]
     for cached in (False, True):
         if cached:
             environment["CACHE_MUST_HIT"] = "1"
-        result = subprocess.run([sys.executable, str(script)], env=environment, text=True, capture_output=True, timeout=60)
-        assert result.returncode == 0, result.stdout + result.stderr
+        # Both artifacts must coexist in one cache, then reload without compiling.
+        for codegen in modes:
+            environment["T1_TEST_CODEGEN"] = codegen
+            result = subprocess.run([sys.executable, str(script)], env=environment, text=True, capture_output=True, timeout=60)
+            assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_toolchain_missing_compiler(monkeypatch):

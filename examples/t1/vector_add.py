@@ -24,10 +24,16 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--size", type=int, default=1025)
     parser.add_argument("--vlen", type=int, default=256)
+    parser.add_argument("--codegen", choices=("c", "llvm"), default="c")
     args = parser.parse_args()
     if args.size <= 0:
         parser.error("--size must be positive")
-    kernel = tilelang.compile(vector_add(args.size), target={"kind": "t1", "vlen": args.vlen}, execution_backend="pokedex", out_idx=-1)
+    kernel = tilelang.compile(
+        vector_add(args.size),
+        target={"kind": "t1", "vlen": args.vlen, "codegen": args.codegen},
+        execution_backend="pokedex",
+        out_idx=-1,
+    )
     for seed in (0, 1):
         generator = torch.Generator().manual_seed(seed)
         a = torch.randn(args.size, generator=generator)
