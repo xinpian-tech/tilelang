@@ -9,6 +9,7 @@ from tvm.ir import CallingConv
 
 import tilelang
 from .target import llvm_target
+from .transform import lower_exp, lower_reductions
 
 
 @tirx.transform.prim_func_pass(opt_level=0)
@@ -168,6 +169,7 @@ def lower(mod: IRModule, target):
         lower_thread_binding=False,
         unsupported_annotations=["cluster_dims", "tl.launch_threads", "pragma_import_c"],
     )(mod)
+    mod = lower_reductions(mod, target)
     mod = prepare(mod)
     mod = tilelang.transform.LegalizeNegativeIndex()(mod)
     mod = tilelang.transform.Simplify()(mod)
@@ -182,6 +184,7 @@ def lower(mod: IRModule, target):
         # lower math operations to default external library calls under `t1`.
         internal_target = llvm_target(target)
         mod = IRModule({gv: func.with_attr("target", internal_target) for gv, func in mod.functions.items()})
+        mod = lower_exp(mod)
         mod = tilelang.transform.LowerIntrin()(mod)
         mod = IRModule({gv: func.with_attr("target", target) for gv, func in mod.functions.items()})
     return mod

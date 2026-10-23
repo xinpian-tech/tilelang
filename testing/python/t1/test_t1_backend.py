@@ -148,7 +148,7 @@ def test_standard_ir_lowering(codegen, kind):
 
 
 @pytest.mark.skipif(llvm_version_major(allow_none=True) is None, reason="LLVM disabled")
-def test_exp_uses_llvm_intrinsic():
+def test_exp_uses_freestanding_arithmetic():
     @T.prim_func
     def main(A: T.Tensor((32,), "float32"), B: T.Tensor((32,), "float32")):
         with T.Kernel(4) as bx:
@@ -156,7 +156,8 @@ def test_exp_uses_llvm_intrinsic():
                 B[bx * 8 + i] = T.exp(A[bx * 8 + i])
 
     artifact = tilelang.lower(main, target={"kind": "t1", "codegen": "llvm", "vlen": 256})
-    assert "llvm.exp.v8f32" in artifact.kernel_source
+    assert "llvm.exp" not in artifact.kernel_source
+    assert "fmul <8 x float>" in artifact.kernel_source
     assert "expf" not in artifact.kernel_source
 
 

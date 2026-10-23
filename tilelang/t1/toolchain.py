@@ -149,6 +149,10 @@ def build(source, wrapper, target, directory, compile_flags=None, *, runtime="po
     extra = list(compile_flags or [])
     invoke([*flags, *extra, "-c", str(kernel_file), "-o", str(directory / "kernel.o")])
     invoke([*flags, "-c", str(directory / "launcher.cpp"), "-o", str(directory / "launcher.o")])
+    # Do not let loop-idiom recognition turn the helpers into calls to themselves.
+    invoke(
+        [*flags, "-fno-builtin", "-fno-vectorize", "-fno-slp-vectorize", "-c", str(RUNTIME / "memory.cpp"), "-o", str(directory / "memory.o")]
+    )
     startup = "fpga_start.S" if runtime == "fpga" else "start.S"
     linker_script = "fpga_link.ld" if runtime == "fpga" else "link.ld"
     invoke([*flags, "-c", str(RUNTIME / startup), "-o", str(directory / "start.o")])
@@ -162,6 +166,7 @@ def build(source, wrapper, target, directory, compile_flags=None, *, runtime="po
             str(directory / "start.o"),
             str(directory / "launcher.o"),
             str(directory / "kernel.o"),
+            str(directory / "memory.o"),
             "-o",
             str(output),
         ]
