@@ -19,7 +19,7 @@ dictionary when you need options such as GPU architecture or CPU model. The most
 | `metal` | Apple Silicon GPUs (arm64 Macs). |
 | `llvm` | CPU execution. Use a config dict for options such as `{"kind": "llvm", "mtriple": "x86_64-linux-gnu"}`. |
 | `webgpu` | Browser / WebGPU runtimes. |
-| `t1` | Experimental four-hart RV32/RVV target, executed by Pokedex. Use `{"kind": "t1", "vlen": 256}`. |
+| `t1` | Experimental four-hart RV32/RVV target, executed by Pokedex or an XDMA-connected FPGA. |
 | `c` | Emit plain C source for inspection or custom toolchains. |
 
 To add options, pass a target config dictionary. For example:
@@ -206,7 +206,16 @@ kernel(a, b, c)  # CPU float32 tensors
 T1 is selected explicitly, not by hardware auto-detection. For an explicit T1
 target, `execution_backend="auto"` selects `pokedex`. Source-only lowering needs
 no simulator or cross compiler. Execution requires Clang/LLD and a matching
-Pokedex runner/model with `run-gpgpu` memory transfers. Scratchpad, atomics,
+Pokedex runner/model with `run-gpgpu` memory transfers. Alternatively, select
+`execution_backend="xdma"` for the `t1_demo` FPGA and specify its actual VLEN
+(1024 bits for the current image). The Linux XDMA driver must expose H2C/C2H
+channel 0 and the GPIO/firewall user BAR with read/write access for the caller.
+The adapter requires scalar/vector AXI firewalls at BAR offsets `0x1000` and
+`0x2000`, both reporting version `2`. Each call isolates and drains the memory
+paths before resetting all four harts, transfers tensors through DDR, and waits
+for per-hart completion records while checking firewall faults. No completion
+delay is enabled by default; an optional debug delay remains available.
+Scratchpad, atomics,
 reductions, and profiling/autotuning are not implemented in this initial backend.
 See the [T1 example](../../examples/t1/README.md) for build instructions, runtime
 environment variables, supported operations, ABI details, and tests.

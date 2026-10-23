@@ -23,15 +23,18 @@ def vector_add(n=1025):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--size", type=int, default=1025)
-    parser.add_argument("--vlen", type=int, default=256)
+    parser.add_argument("--vlen", type=int, default=None)
+    parser.add_argument("--execution-backend", choices=("pokedex", "xdma"), default="pokedex")
     parser.add_argument("--codegen", choices=("c", "llvm"), default="c")
     args = parser.parse_args()
+    if args.vlen is None:
+        args.vlen = 1024 if args.execution_backend == "xdma" else 256
     if args.size <= 0:
         parser.error("--size must be positive")
     kernel = tilelang.compile(
         vector_add(args.size),
         target={"kind": "t1", "vlen": args.vlen, "codegen": args.codegen},
-        execution_backend="pokedex",
+        execution_backend=args.execution_backend,
         out_idx=-1,
     )
     for seed in (0, 1):
