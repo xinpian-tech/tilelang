@@ -1,10 +1,10 @@
-"""T1's global-buffer lowering, with C and explicit LLVM vector paths.
+"""T1's four-hart lowering, with C and explicit LLVM vector paths.
 
 One frontend function describes one four-block launch. The device entry takes
 the original buffers followed by the block ID; no host function is generated.
 """
 
-from tvm import IRModule, tirx, transform
+from tvm import DataType, IRModule, tirx, transform
 from tvm.ir import CallingConv
 
 import tilelang
@@ -61,22 +61,25 @@ def prepare(func, mod, ctx):
                 allowed += (tirx.ForKind.PARALLEL, tirx.ForKind.VECTORIZED)
             if node.kind not in allowed:
                 raise ValueError("T1 supports serial/parallel elementwise loops; explicit vector and thread loops are unsupported")
-        if isinstance(node, tirx.PrimExpr):
-            dtype = str(node.dtype)
-            if dtype not in ("handle", "bool", "int32", "uint32", "float32"):
-                raise ValueError(f"T1 does not yet support scalar expression dtype {dtype}")
-        if isinstance(node, (tirx.Min, tirx.Max, tirx.FloorDiv, tirx.FloorMod)):
-            raise ValueError("T1 min/max and floor division/modulo expressions are not implemented yet")
-        if isinstance(node, tirx.Mod) and str(node.dtype) == "float32":
-            raise ValueError("T1 floating-point modulo is not implemented yet")
         if isinstance(node, tirx.SBlock) and (node.init is not None or node.iter_vars or node.match_buffers):
             raise ValueError("T1 reduction blocks and buffer aliases are not implemented yet")
         if isinstance(node, tirx.Call):
             name = getattr(node.op, "name", str(node.op))
-            if name not in ("tirx.if_then_else", "tirx.likely"):
-                raise ValueError(f"T1 does not yet support operation {name}; use global-buffer elementwise expressions")
-        if isinstance(node, tirx.AllocBuffer) or (isinstance(node, tirx.SBlock) and node.alloc_buffers):
-            raise ValueError("T1 local/shared allocations are not implemented yet; use global buffers")
+            lowering_targets = ("llvm" if explicit else "t1", "default")
+            if name.startswith("tl.") and not any(
+                node.op.has_attr(f"{target}.{rule}") and node.op.get_attr(f"{target}.{rule}") is not None
+                for target in lowering_targets
+                for rule in ("FLowerIntrinsic", "FLegalize")
+            ):
+                raise ValueError(f"T1 does not yet support operation {name}; TileLang operation lowering is required")
+        buffers = []
+        if isinstance(node, tirx.AllocBuffer):
+            buffers = [node.buffer]
+        elif isinstance(node, tirx.SBlock):
+            buffers = node.alloc_buffers
+        for buffer in buffers:
+            if buffer.scope() not in ("local", "local.var"):
+                raise ValueError(f"T1 allocations in scope {buffer.scope()!r} are not implemented; use local storage")
         return None
 
     body = tirx.stmt_functor.ir_transform(func.body, None, visit)
@@ -141,7 +144,7 @@ def vectorize(mod, target):
         scalarized = []
         tirx.stmt_functor.post_order_visit(
             node.body,
-            lambda node: stores.append(node) if isinstance(node, tirx.BufferStore) and node.value.dtype != "float32" else None,
+            lambda node: stores.append(node) if isinstance(node, tirx.BufferStore) and DataType(node.value.dtype).lanes > 1 else None,
         )
         tirx.stmt_functor.post_order_visit(node.body, lambda child: scalarized.append(child) if isinstance(child, tirx.For) else None)
         if not stores or scalarized:
@@ -175,4 +178,10 @@ def lower(mod: IRModule, target):
     mod = tirx.transform.RemoveNoOp()(mod)
     if str(target.attrs["codegen"]) == "llvm":
         mod = vectorize(mod, target)
+        # Select LLVM intrinsic rules before the common codegen preparation can
+        # lower math operations to default external library calls under `t1`.
+        internal_target = llvm_target(target)
+        mod = IRModule({gv: func.with_attr("target", internal_target) for gv, func in mod.functions.items()})
+        mod = tilelang.transform.LowerIntrin()(mod)
+        mod = IRModule({gv: func.with_attr("target", target) for gv, func in mod.functions.items()})
     return mod

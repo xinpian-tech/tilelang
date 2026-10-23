@@ -8,7 +8,7 @@
 namespace tvm::codegen {
 
 // T1 emits scalar freestanding C++; Clang performs RVV vectorization. The
-// pipeline rejects vector IR and runtime-dependent operations before codegen.
+// LLVM codegen uses TVM's implementation directly instead of this class.
 class CodeGenT1 final : public CodeGenCWithLineDirectives {
 public:
   void Initialize() {
@@ -17,6 +17,13 @@ public:
   }
 
   void PrintFuncPrefix(std::ostream &os) final { os << "extern \"C\" "; }
+
+  void PrintStorageScope(const std::string &scope, std::ostream &os) final {
+    if (scope == "local" || scope == "local.var") {
+      return;
+    }
+    CodeGenCWithLineDirectives::PrintStorageScope(scope, os);
+  }
 };
 
 ffi::Module BuildT1(const IRModule &mod, const Target &target) {

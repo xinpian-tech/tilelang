@@ -76,6 +76,90 @@ def test_explicit_vector_source(monkeypatch, vlen):
     assert any(str(store.value.dtype) == f"float32x{vlen // 32}" for store in stores)
 
 
+@pytest.mark.parametrize("codegen", CODEGENS)
+def test_min_max_lowering(codegen):
+    @T.prim_func
+    def main(A: T.Tensor((32,), "float32"), B: T.Tensor((32,), "float32")):
+        with T.Kernel(4) as bx:
+            for i in T.Parallel(8):
+                B[bx * 8 + i] = T.max(T.min(A[bx * 8 + i], 1.0), -1.0)
+
+    artifact = tilelang.lower(main, target={"kind": "t1", "codegen": codegen, "vlen": 256})
+    assert artifact.kernel_source
+    if codegen == "llvm":
+        function = next(iter(artifact.device_mod.functions.values()))
+        stores = []
+        tirx.stmt_functor.post_order_visit(function.body, lambda node: stores.append(node) if isinstance(node, tirx.BufferStore) else None)
+        assert any(str(store.value.dtype) == "float32x8" for store in stores)
+
+
+def standard_ir_kernel(kind):
+    if kind == "integer":
+
+        @T.prim_func
+        def main(A: T.Tensor((36,), "float32"), B: T.Tensor((4, 36), "float32")):
+            with T.Kernel(4) as bx:
+                for i in T.Parallel(9):
+                    j = bx * 9 + i
+                    x = T.Cast("int32", A[j])
+                    divisor = bx * 2 - 3
+                    B[0, j] = T.Cast("float32", x // divisor)
+                    B[1, j] = T.Cast("float32", x % divisor)
+                    B[2, j] = T.Cast("float32", (T.Cast("int8", x) >> 2) & 31)
+                    B[3, j] = T.reinterpret(T.reinterpret(A[j], "uint32") ^ T.uint32(2147483648), "float32")
+
+    elif kind == "local":
+
+        @T.prim_func
+        def main(A: T.Tensor((36,), "float32"), B: T.Tensor((36,), "float32")):
+            with T.Kernel(4) as bx:
+                total = T.alloc_var("float32", init=0.0)
+                scratch = T.alloc_local((9,), "float32")
+                for i in T.serial(9):
+                    scratch[i] = A[bx * 9 + i] * 2.0
+                for i in T.serial(9):
+                    total = total + scratch[i]
+                for i in T.Parallel(9):
+                    B[bx * 9 + i] = A[bx * 9 + i] * 2.0 + total
+
+    else:
+
+        @T.prim_func
+        def main(A: T.Tensor((36,), "float32"), B: T.Tensor((36,), "float32")):
+            with T.Kernel(4) as bx:
+                for i in T.Parallel(9):
+                    B[bx * 9 + i] = T.sqrt(T.clamp(T.abs(A[bx * 9 + i]), 0.0, 256.0))
+
+    return main
+
+
+STANDARD_IR_CASES = [(codegen, kind) for codegen in ("c", "llvm") for kind in ("integer", "local")]
+STANDARD_IR_CASES.append(("llvm", "math"))
+
+
+@pytest.mark.parametrize(("codegen", "kind"), STANDARD_IR_CASES)
+def test_standard_ir_lowering(codegen, kind):
+    if codegen == "llvm" and llvm_version_major(allow_none=True) is None:
+        pytest.skip("LLVM disabled")
+    artifact = tilelang.lower(standard_ir_kernel(kind), target={"kind": "t1", "codegen": codegen, "vlen": 256})
+    if kind == "math":
+        assert "llvm.sqrt.v8f32" in artifact.kernel_source
+        assert "sqrtf" not in artifact.kernel_source
+
+
+@pytest.mark.skipif(llvm_version_major(allow_none=True) is None, reason="LLVM disabled")
+def test_exp_uses_llvm_intrinsic():
+    @T.prim_func
+    def main(A: T.Tensor((32,), "float32"), B: T.Tensor((32,), "float32")):
+        with T.Kernel(4) as bx:
+            for i in T.Parallel(8):
+                B[bx * 8 + i] = T.exp(A[bx * 8 + i])
+
+    artifact = tilelang.lower(main, target={"kind": "t1", "codegen": "llvm", "vlen": 256})
+    assert "llvm.exp.v8f32" in artifact.kernel_source
+    assert "expf" not in artifact.kernel_source
+
+
 @pytest.mark.skipif(llvm_version_major(allow_none=True) is None, reason="LLVM disabled")
 def test_unsupported_vector_control_flow():
     @T.prim_func
@@ -142,7 +226,7 @@ def test_shared_memory_is_rejected():
             shared[bx] = A[bx]
             A[bx] = shared[bx]
 
-    with pytest.raises(ValueError, match="allocations are not implemented"):
+    with pytest.raises(ValueError, match="allocations in scope.*are not implemented"):
         lower(main)
 
 
@@ -175,6 +259,34 @@ def simulator():
     if not executable or not shutil.which(executable) or not model or not Path(model).is_file():
         pytest.skip("set TILELANG_POKEDEX and POKEDEX_MODEL_LIB for execution tests")
     return executable
+
+
+@pytest.mark.parametrize(("codegen", "kind"), STANDARD_IR_CASES)
+def test_standard_ir_execution(simulator, codegen, kind):
+    if codegen == "llvm" and llvm_version_major(allow_none=True) is None:
+        pytest.skip("LLVM disabled")
+    flags = ["-fno-vectorize", "-fno-slp-vectorize"] if codegen == "llvm" else None
+    kernel = tilelang.compile(
+        standard_ir_kernel(kind), target={"kind": "t1", "codegen": codegen, "vlen": 256}, out_idx=-1, compile_flags=flags
+    )
+    a = torch.arange(-18, 18, dtype=torch.float32) * 17
+    if kind == "integer":
+        x = a.to(torch.int32)
+        divisor = torch.tensor([-3, -1, 1, 3], dtype=torch.int32).repeat_interleave(9)
+        expected = torch.stack(
+            [
+                torch.div(x, divisor, rounding_mode="floor").float(),
+                torch.remainder(x, divisor).float(),
+                ((x.to(torch.int8) >> 2) & 31).float(),
+                -a,
+            ]
+        )
+    elif kind == "local":
+        doubled = a.reshape(4, 9) * 2
+        expected = (doubled + doubled.sum(dim=1, keepdim=True)).reshape(36)
+    else:
+        expected = torch.sqrt(torch.clamp(torch.abs(a), 0, 256))
+    torch.testing.assert_close(kernel(a), expected, rtol=1e-6, atol=0)
 
 
 @pytest.mark.parametrize(("n", "vlen"), [(1025, 256), (259, 128), (3, 256)])
